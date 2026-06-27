@@ -125,31 +125,12 @@ class AppDb {
     }
   }
 
-  /// Marks rows accessible/inaccessible in bulk. Inaccessible = our app can't
-  /// read the bytes (cloned-app storage). We also reset any falsely-"uploaded"
-  /// status back to pending, since such items were never actually read/uploaded
-  /// (a same-named cloud object can match them during reconciliation).
-  Future<void> setAccessible(List<String> ids, bool value) async {
-    if (ids.isEmpty) return;
+  /// One-time repair: clear any "inaccessible" flags set by an earlier build
+  /// that wrongly demoted readable cloned-app files. Reconcile then re-matches
+  /// them to the cloud, so their backed-up status is restored.
+  Future<void> clearInaccessibleFlags() async {
     final d = await db;
-    const chunk = 400;
-    for (var i = 0; i < ids.length; i += chunk) {
-      final part = ids.sublist(i, (i + chunk).clamp(0, ids.length));
-      final ph = List.filled(part.length, '?').join(',');
-      if (value) {
-        await d.rawUpdate(
-            'UPDATE assets SET accessible = 1 WHERE id IN ($ph)', part);
-      } else {
-        // Demote false "uploaded"/"uploading" -> pending; keep deletedLocal
-        // (those were genuinely offloaded earlier and have a cached thumb).
-        await d.rawUpdate(
-            "UPDATE assets SET accessible = 0, "
-            "status = CASE WHEN status IN ('uploaded','uploading') "
-            "THEN 'pending' ELSE status END, remote_path = NULL "
-            'WHERE id IN ($ph)',
-            part);
-      }
-    }
+    await d.rawUpdate('UPDATE assets SET accessible = 1 WHERE accessible = 0');
   }
 
   /// Removes assets from the index entirely (used by an explicit Delete, so the

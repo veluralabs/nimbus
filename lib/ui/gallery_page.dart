@@ -139,6 +139,10 @@ class GalleryPage extends StatelessWidget {
           child: RefreshIndicator(
           onRefresh: sync.scan,
           child: CustomScrollView(
+          // Prefetch ~1.5 screens of tiles so thumbnails are decoded just before
+          // they scroll into view — smoother than the default ~250px window,
+          // without the memory blow-up of caching the whole 96k-item list.
+          cacheExtent: 1200,
           slivers: [
             if (sync.selecting)
               SliverAppBar(

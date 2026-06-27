@@ -1,9 +1,11 @@
 import 'dart:async';
 
+import 'package:battery_plus/battery_plus.dart';
 import 'package:flutter_foreground_task/flutter_foreground_task.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
 import '../data/app_db.dart';
+import '../models/media_asset.dart';
 import 'auth_service.dart';
 import 'conditions.dart';
 import 'db_sync.dart';
@@ -55,91 +57,134 @@ class _BackupTaskHandler extends TaskHandler {
 
     final db = AppDb.instance;
     final media = MediaService();
-    final gcs = GcsClient();
 
-    // Refresh index, then back up everything pending.
-    final found = await media.listAll();
-    await db.upsertNewAssets(found);
-    // accessible = 1 excludes cloned-app (/emulated/999/) items we can't read.
-    final pending = await db.assetsWhere(
-        "status IN ('pending','failed') AND accessible = 1", const []);
-
-    final mgr = UploadManager(gcs, media, db, uid);
-    final total = pending.length;
-
-    // Network/battery gating: pause uploads on mobile data (unless bypassed) or
-    // low battery. A periodic check flips the flag so backupAll stops cleanly.
+    // Network/battery gating, re-evaluated continuously. CRITICAL: when the
+    // screen turns off many phones (esp. Oppo/ColorOS) drop the Wi-Fi radio for
+    // a moment, which used to make us pause AND stop the service — so the whole
+    // backup died on screen-off. Now we keep the foreground service alive and
+    // simply WAIT, resuming automatically the instant conditions return.
     bool paused = false;
     String reason = '';
     Future<void> checkCond() async {
       final c = await UploadConditions.check();
       paused = !c.ok;
       reason = c.reason;
-      if (paused) {
-        FlutterForegroundTask.updateService(
-            notificationTitle: 'Backup paused', notificationText: reason);
-      }
     }
 
-    await checkCond();
     final condTimer =
         Timer.periodic(const Duration(seconds: 8), (_) => checkCond());
-    try {
-      if (!paused) {
-        await mgr.backupAll(
-          pending,
-          deleteAfter: deleteAfter,
-          shouldStop: () => paused,
-          onChange: (a) {
-            final done = pending.where((x) => x.isSafeInCloud).length;
-            FlutterForegroundTask.updateService(
-              notificationTitle: 'Backing up your photos',
-              notificationText: '$done / $total uploaded',
-            );
-            FlutterForegroundTask.sendDataToMain(
-                {'phase': 'upload', 'done': done, 'total': total});
-          },
-        );
-      }
-    } catch (_) {/* keep going */} finally {
-      condTimer.cancel();
-      gcs.dispose();
-    }
 
-    // If uploads were paused by conditions, stop now and retry later (the
-    // periodic WorkManager re-runs when conditions are met).
-    if (paused) {
-      FlutterForegroundTask.sendDataToMain({'phase': 'done'});
-      FlutterForegroundTask.stopService();
-      return;
-    }
+    // Throttle status-bar notification updates. Updating per-file trips
+    // Android's notification rate limit ("Shedding ..." in logcat) and makes the
+    // progress counter stutter; once every ~2s is smooth and cheap.
+    DateTime lastNotif = DateTime.fromMillisecondsSinceEpoch(0);
 
-    // Then analyze (categories + on-device faces) in the background.
-    FlutterForegroundTask.updateService(
-      notificationTitle: 'Organizing your library',
-      notificationText: 'Finding categories and people…',
-    );
+    // Enumerate the device library ONCE up front (it's expensive). The loop
+    // below only re-queries the DB for what's still pending — re-scanning
+    // MediaStore on every resume would waste CPU/battery.
+    final found = await media.listAll();
+    await db.upsertNewAssets(found);
+
     try {
-      final ml = MlProcessor();
-      ml.addListener(() {
-        if (ml.toProcess > 0) {
+      // Keep working across screen-off / network blips until nothing is left.
+      while (true) {
+        await checkCond();
+        if (paused) {
           FlutterForegroundTask.updateService(
-            notificationTitle: 'Organizing your library',
-            notificationText: 'Analyzed ${ml.processed} / ${ml.toProcess}',
-          );
-          FlutterForegroundTask.sendDataToMain(
-              {'phase': 'analyze', 'done': ml.processed, 'total': ml.toProcess});
+              notificationTitle: 'Backup paused', notificationText: reason);
+          await Future.delayed(const Duration(seconds: 20));
+          continue; // re-evaluate; do NOT stop the service
         }
-      });
-      await ml.analyzePending();
-    } catch (_) {/* best effort */}
+
+        final pending = await db.assetsWhere(
+            "status IN ('pending','failed')", const []);
+        if (pending.isEmpty) break; // everything is safe in the cloud
+
+        // Count what's already uploaded so we can detect "no progress" passes
+        // and avoid spinning forever on permanently-failing items.
+        final before = await db.statusCounts();
+        final safeBefore = (before[SyncStatus.uploaded] ?? 0) +
+            (before[SyncStatus.deletedLocal] ?? 0);
+
+        final gcs = GcsClient();
+        try {
+          final mgr = UploadManager(gcs, media, db, uid);
+          await mgr.backupAll(
+            pending,
+            deleteAfter: deleteAfter,
+            // Pace uploads so we don't peg a CPU core / drain battery: a short
+            // gap between files keeps average CPU well under the ~20% target.
+            paceMs: 60,
+            shouldStop: () => paused, // breaks cleanly; outer loop waits + resumes
+            onChange: (a) {
+              final now = DateTime.now();
+              if (now.difference(lastNotif).inMilliseconds < 2000) return;
+              lastNotif = now;
+              final done = pending.where((x) => x.isSafeInCloud).length;
+              FlutterForegroundTask.updateService(
+                notificationTitle: 'Backing up your photos',
+                notificationText: 'Uploaded $done / ${pending.length}',
+              );
+              FlutterForegroundTask.sendDataToMain(
+                  {'phase': 'upload', 'done': done, 'total': pending.length});
+            },
+          );
+        } catch (_) {/* transient — outer loop retries */} finally {
+          gcs.dispose();
+        }
+        if (paused) continue; // conditions dropped mid-batch; wait then resume
+
+        // Completed a full pass while unpaused: if nothing new got uploaded,
+        // the remainder are permanent failures — stop rather than spin forever.
+        final after = await db.statusCounts();
+        final safeAfter = (after[SyncStatus.uploaded] ?? 0) +
+            (after[SyncStatus.deletedLocal] ?? 0);
+        if (safeAfter <= safeBefore) break;
+      }
+    } finally {
+      condTimer.cancel();
+    }
 
     // Snapshot the local index to the cloud so a reinstall restores everything.
-    await DbSync.backup(uid);
+    try {
+      await DbSync.backup(uid);
+    } catch (_) {/* best effort */}
+
+    // Heavy ML analysis (TFLite + face decode) is memory-hungry and, with the
+    // screen off on battery, gets the app low-memory-killed (the "crash"). Only
+    // run it while CHARGING — typically overnight — so the BACKUP itself always
+    // completes reliably. Otherwise it runs next time the app is open/charging.
+    final battery = Battery();
+    final st = await battery.batteryState;
+    final charging =
+        st == BatteryState.charging || st == BatteryState.full;
+    if (charging) {
+      FlutterForegroundTask.updateService(
+        notificationTitle: 'Organizing your library',
+        notificationText: 'Finding categories and people…',
+      );
+      try {
+        final ml = MlProcessor();
+        ml.addListener(() {
+          if (ml.toProcess > 0) {
+            FlutterForegroundTask.updateService(
+              notificationTitle: 'Organizing your library',
+              notificationText: 'Analyzed ${ml.processed} / ${ml.toProcess}',
+            );
+            FlutterForegroundTask.sendDataToMain({
+              'phase': 'analyze',
+              'done': ml.processed,
+              'total': ml.toProcess
+            });
+          }
+        });
+        await ml.analyzePending();
+      } catch (_) {/* best effort */}
+    }
 
     FlutterForegroundTask.updateService(
       notificationTitle: 'Photos',
-      notificationText: 'Backup & organize complete',
+      notificationText: 'Backup complete',
     );
     FlutterForegroundTask.sendDataToMain({'phase': 'done'});
     FlutterForegroundTask.stopService();
@@ -160,6 +205,9 @@ void initBackgroundService() {
     foregroundTaskOptions: ForegroundTaskOptions(
       eventAction: ForegroundTaskEventAction.nothing(),
       autoRunOnBoot: false,
+      // Hold a CPU wake lock + Wi-Fi lock so the OS can't freeze the upload
+      // isolate or power down the radio while the screen is off.
+      allowWakeLock: true,
       allowWifiLock: true,
     ),
   );
@@ -168,6 +216,13 @@ void initBackgroundService() {
 /// Starts the background backup+analyze service (idempotent).
 Future<void> startBackupService() async {
   if (await FlutterForegroundTask.isRunningService) return;
+  // Ask the OS (once) to stop freezing/killing us in Doze. Without this, OEM
+  // battery managers suspend the service the moment the screen turns off.
+  try {
+    if (!await FlutterForegroundTask.isIgnoringBatteryOptimizations) {
+      await FlutterForegroundTask.requestIgnoreBatteryOptimization();
+    }
+  } catch (_) {/* not all OEMs expose this; the foreground service still runs */}
   await FlutterForegroundTask.startService(
     serviceId: 451,
     notificationTitle: 'Anjish',

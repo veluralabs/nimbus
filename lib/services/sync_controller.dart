@@ -41,18 +41,12 @@ class SyncController extends ChangeNotifier {
   bool syncing = false;
   bool deleteAfterUpload = false;
 
-  /// When true, cloned-app images we can't read (/emulated/999/) are hidden from
-  /// the gallery instead of showing a "can't access" placeholder. Persisted.
-  bool hideInaccessible = false;
-
   /// Sets the asset list and recomputes the (expensive) timeline grouping ONCE,
   /// instead of regrouping ~96k assets on every widget rebuild.
   void _setAssets(List<MediaAsset> list) {
     assets = list;
     visibleAssets = list
-        .where((a) =>
-            (a.kind == MediaKind.image || a.kind == MediaKind.video) &&
-            (a.accessible || !hideInaccessible))
+        .where((a) => a.kind == MediaKind.image || a.kind == MediaKind.video)
         .toList();
     final out = <TimelineSection>[];
     int i = 0;
@@ -114,63 +108,6 @@ class SyncController extends ChangeNotifier {
     notifyListeners();
   }
 
-  bool scanningAccess = false;
-
-  /// Flags images/videos our app can't actually read — chiefly files in a
-  /// cloned-app space (/storage/emulated/999/, e.g. App-Clone WhatsApp), which
-  /// Android forbids third-party apps from accessing. They get accessible=0 (so
-  /// the UI shows a "Cloned app — can't access" tile and they're excluded from
-  /// backup), instead of being deleted, since the user wants to keep the rows.
-  /// Runs once per install, throttled, in the background.
-  Future<void> markInaccessible() async {
-    if (scanningAccess) return;
-    scanningAccess = true;
-    final candidates = await _db.assetsWhere(
-        "kind IN ('image','video') AND status != 'deletedLocal'", const []);
-    final bad = <String>[];
-    for (final a in candidates) {
-      if (a.isFileAsset) continue; // resolved by path already
-      // STRICT: only flag when the file resolves to ANOTHER Android user space
-      // (/emulated/<nonzero>/, e.g. /999/ App-Clone). Never flag on a null/error
-      // result — a transient MediaStore failure must not demote a readable,
-      // already-backed-up photo to "can't access".
-      try {
-        final e = await _media.entity(a.id);
-        final f = await e?.file;
-        final path = f?.path;
-        if (path != null && _otherUserSpace(path)) bad.add(a.id);
-      } catch (_) {/* leave accessible */}
-      await Future.delayed(const Duration(milliseconds: 4)); // stay responsive
-    }
-    if (bad.isNotEmpty) {
-      await _db.setAccessible(bad, false);
-      _setAssets(await _db.allAssets());
-      notifyListeners();
-    }
-    scanningAccess = false;
-  }
-
-  /// True if a resolved file path lives in another Android user's storage
-  /// (/storage/emulated/<nonzero>/ — App-Clone / Parallel-App space we can't
-  /// read). User 0 (/emulated/0/) is the normal, readable primary profile.
-  static final _otherUser = RegExp(r'/emulated/(\d+)/');
-  bool _otherUserSpace(String path) {
-    final m = _otherUser.firstMatch(path);
-    return m != null && m.group(1) != '0';
-  }
-
-  /// Toggles whether unreadable cloned-app items are hidden entirely (vs shown
-  /// as a "can't access" placeholder). Persisted; re-filters the live view.
-  Future<void> setHideInaccessible(bool value) async {
-    hideInaccessible = value;
-    final prefs = await SharedPreferences.getInstance();
-    await prefs.setBool('hide_inaccessible_$uid', value);
-    // Make sure accessibility has actually been computed before hiding.
-    if (value) await markInaccessible();
-    _setAssets(assets);
-    notifyListeners();
-  }
-
   /// Reloads the asset list from the DB (e.g. after an AI edit adds a new copy).
   Future<void> refreshFromDb() async {
     _setAssets(await _db.allAssets());
@@ -202,7 +139,16 @@ class SyncController extends ChangeNotifier {
 
   Future<void> load() async {
     final prefs = await SharedPreferences.getInstance();
-    hideInaccessible = prefs.getBool('hide_inaccessible_$uid') ?? false;
+    // One-time repair: an earlier build wrongly flagged cloned-app
+    // (/emulated/999/) files as "can't access" and reset their backed-up status,
+    // even though they ARE readable (via the content resolver) and were already
+    // uploaded. Clear the flag, restore accessibility, and force a re-reconcile
+    // so those files get re-matched to the cloud instead of needlessly re-sent.
+    if (!(prefs.getBool('clone_revert_v3') ?? false)) {
+      await _db.clearInaccessibleFlags();
+      await prefs.remove('cloud_reconciled_$uid');
+      await prefs.setBool('clone_revert_v3', true);
+    }
     // Show the cached library instantly on cold start...
     _setAssets(await _db.allAssets());
     syncing = await FlutterForegroundTask.isRunningService;
@@ -214,12 +160,6 @@ class SyncController extends ChangeNotifier {
       if (!(prefs.getBool('cloud_reconciled_$uid') ?? false)) {
         await reconcileWithCloud();
         await prefs.setBool('cloud_reconciled_$uid', true);
-      }
-      // Flag cloned-app (/emulated/999/) items once per install so they show a
-      // "can't access" tile and stay out of the backup/cloud-storage figures.
-      if (!(prefs.getBool('access_scanned_$uid') ?? false)) {
-        await markInaccessible();
-        await prefs.setBool('access_scanned_$uid', true);
       }
     });
   }
@@ -244,8 +184,7 @@ class SyncController extends ChangeNotifier {
         cloudByBasename[base] = name;
       }
       if (cloudByBasename.isNotEmpty) {
-        final pending = await _db.assetsWhere(
-            "status = 'pending' AND accessible = 1", const []);
+        final pending = await _db.assetsWhere("status = 'pending'", const []);
         for (final a in pending) {
           final obj = cloudByBasename[a.name.toLowerCase()];
           if (obj != null) {

@@ -127,23 +127,6 @@ class SettingsPage extends StatelessWidget {
             ),
           ),
           const SizedBox(height: 8),
-          ListenableBuilder(
-            listenable: sync,
-            builder: (_, child) => Card(
-              child: SwitchListTile(
-                secondary: const Icon(Icons.copy_all_rounded),
-                title: const Text('Hide cloned-app photos'),
-                subtitle: const Text(
-                    'Photos from App-Clone / Parallel apps (e.g. cloned WhatsApp) '
-                    'live in a space Android won’t let this app read, so they can’t '
-                    'be shown or backed up. On = hide them; off = show a '
-                    '“can’t access” tile.'),
-                value: sync.hideInaccessible,
-                onChanged: sync.setHideInaccessible,
-              ),
-            ),
-          ),
-          const SizedBox(height: 8),
 
           _SectionTitle('AI analysis'),
           const Card(child: _CloudLabelsToggle()),

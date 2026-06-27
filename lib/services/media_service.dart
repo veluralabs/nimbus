@@ -1,3 +1,4 @@
+import 'dart:async';
 import 'dart:io';
 import 'dart:typed_data';
 
@@ -8,7 +9,9 @@ import 'package:path/path.dart' as p;
 import 'package:path_provider/path_provider.dart';
 import 'package:photo_manager/photo_manager.dart';
 
+import '../data/app_db.dart';
 import '../models/media_asset.dart';
+import 'gcs_client.dart';
 
 /// Capture metadata for a photo/video: date/time + GPS + reverse-geocoded place.
 class AssetMeta {
@@ -91,7 +94,32 @@ class MediaService {
   // In-memory thumbnail cache so the grid doesn't re-decode tiles on every
   // rebuild (the #1 source of scroll/rebuild jank). Simple LRU by insertion.
   static final _thumbCache = <String, Uint8List>{};
-  static const _thumbCacheMax = 250;
+  static const _thumbCacheMax = 400;
+
+  // Bound concurrent thumbnail decodes. A fast fling (with a large cacheExtent)
+  // would otherwise launch hundreds of native Glide/compress jobs at once →
+  // memory thrash, jank, OOM, and blank tiles. Cap to a handful at a time; the
+  // rest queue and run as slots free up.
+  static int _active = 0;
+  static final _waiters = <Completer<void>>[];
+  static const _maxConcurrent = 6;
+  static Future<void> _acquire() {
+    if (_active < _maxConcurrent) {
+      _active++;
+      return Future.value();
+    }
+    final c = Completer<void>();
+    _waiters.add(c); // slot is handed over directly on release
+    return c.future;
+  }
+
+  static void _release() {
+    if (_waiters.isNotEmpty) {
+      _waiters.removeAt(0).complete(); // transfer the slot to the next waiter
+    } else if (_active > 0) {
+      _active--;
+    }
+  }
 
   /// Synchronous cache hit, if present — lets the UI render instantly without
   /// a FutureBuilder flash on rebuild.
@@ -116,7 +144,15 @@ class MediaService {
     final key = '$id@$px';
     final hit = _thumbCache[key];
     if (hit != null) return hit;
+    await _acquire();
+    try {
+      return await _thumbnail(id, px, key);
+    } finally {
+      _release();
+    }
+  }
 
+  Future<Uint8List?> _thumbnail(String id, int px, String key) async {
     // AssetEntity.fromId hits a MediaStore cursor that can transiently fail
     // ("CursorWindow NO_MEMORY") under memory pressure — retry briefly.
     AssetEntity? e = await AssetEntity.fromId(id);
@@ -145,8 +181,10 @@ class MediaService {
     // and re-encode from the actual file/origin bytes, which always decodes.
     if (b == null || !_looksJpeg(b)) {
       // Fallback A: native compressor re-encodes the original from its path.
+      // Timeboxed so a slow/hanging cross-user (/999/) read can't hold the
+      // concurrency slot forever (which would freeze the rest of the grid).
       try {
-        final file = await e.file;
+        final file = await e.file.timeout(const Duration(seconds: 6));
         if (file != null) {
           final c = await FlutterImageCompress.compressWithFile(
             file.path,
@@ -163,7 +201,7 @@ class MediaService {
       // Fallback B: the exact path the viewer uses — raw original bytes — then
       // downscale them. Covers images where e.file is null but originBytes work.
       try {
-        final raw = await e.originBytes;
+        final raw = await e.originBytes.timeout(const Duration(seconds: 8));
         if (raw != null) {
           final c = await FlutterImageCompress.compressWithList(
             raw,
@@ -174,15 +212,70 @@ class MediaService {
           );
           if (_looksJpeg(c)) b = c;
         }
-      } catch (_) {/* give up -> caller shows placeholder */}
+      } catch (_) {/* give up -> caller falls back to cloud, then placeholder */}
     }
     if (b != null && _looksJpeg(b)) {
       if (_thumbCache.length >= _thumbCacheMax) {
         _thumbCache.remove(_thumbCache.keys.first);
       }
       _thumbCache[key] = b;
+      return b;
     }
-    return b;
+    return null;
+  }
+
+  // ── Cloud thumbnail fallback ──────────────────────────────────────────────
+  // When on-device thumbnailing fails for an already-uploaded item, fetch the
+  // object from the bucket and downscale it. The object is guaranteed to exist
+  // (it was uploaded), so this is the reliable path for the few stubborn tiles.
+  // Result is cached to disk (thumbPath) so each one downloads at most once.
+  GcsClient? _gcs;
+  static int _netActive = 0;
+  static const _maxNet = 3; // bound concurrent cloud downloads
+
+  Future<Uint8List?> cloudThumbnail(MediaAsset a) async {
+    final remote = a.remotePath;
+    if (remote == null) return null;
+    final key = '${a.id}@cloud';
+    final hit = _thumbCache[key];
+    if (hit != null) return hit;
+    while (_netActive >= _maxNet) {
+      await Future.delayed(const Duration(milliseconds: 120));
+    }
+    _netActive++;
+    try {
+      _gcs ??= GcsClient();
+      if (!_gcs!.isReady) await _gcs!.init();
+      final raw = await _gcs!.download(remote);
+      final c = await FlutterImageCompress.compressWithList(
+        Uint8List.fromList(raw),
+        minWidth: 440,
+        minHeight: 440,
+        quality: 85,
+        format: CompressFormat.jpeg,
+      );
+      if (!_looksJpeg(c)) return null;
+      // Persist to disk + DB so the gallery shows it instantly forever after.
+      try {
+        final dir = Directory(
+            p.join((await getApplicationDocumentsDirectory()).path, 'thumbs'));
+        await dir.create(recursive: true);
+        final safe = a.id.replaceAll(RegExp(r'[^a-zA-Z0-9]'), '_');
+        final f = File(p.join(dir.path, '$safe.jpg'));
+        await f.writeAsBytes(c);
+        a.thumbPath = f.path;
+        await AppDb.instance.updateAsset(a);
+      } catch (_) {/* in-memory cache still helps this session */}
+      if (_thumbCache.length >= _thumbCacheMax) {
+        _thumbCache.remove(_thumbCache.keys.first);
+      }
+      _thumbCache[key] = c;
+      return c;
+    } catch (_) {
+      return null;
+    } finally {
+      _netActive--;
+    }
   }
 
   /// An aspect-correct, memory-bounded JPEG (native-decoded, never a full-res

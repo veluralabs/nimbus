@@ -116,11 +116,15 @@ class UploadManager {
     required bool deleteAfter,
     bool Function()? shouldStop,
     void Function(MediaAsset)? onChange,
+    int paceMs = 0,
   }) async {
     await _gcs.init();
     for (final a in assets) {
       if (shouldStop?.call() ?? false) break;
       await backupOne(a, deleteAfter: deleteAfter, onChange: onChange);
+      // Battery/CPU pacing: a short gap between files so a long backup doesn't
+      // peg a core or spike power draw. Skipped (0) for foreground/manual runs.
+      if (paceMs > 0) await Future.delayed(Duration(milliseconds: paceMs));
     }
   }
 }
